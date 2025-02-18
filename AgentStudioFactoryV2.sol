@@ -40,7 +40,7 @@ interface IPremineZap {
 
 interface IFlaunch {
     function tokenId(address _memecoin) external view returns (uint256);
-    function approve(address to, uint256 tokenId) external;
+    function approve(address to, uint256 tokenId) external payable;
 }
 
 interface ITreasuryManager {
@@ -78,14 +78,14 @@ contract AgentStudioFactory is AccessControl {
     mapping(address => address) public memecoinToManager;
     mapping(address => bool) public isRegisteredManager;
 
-    error NotCreator();
-    error InvalidManager();
-    error InvalidAddress();
-    error ImplementationNotSet();
-    error NFTTransferFailed();
-    error RefundFailed();
-    error ApprovalFailed();
-    error InitializationFailed();
+    error NotCreator(address sender, address expectedCreator);
+    error InvalidManager(address manager, string reason);
+    error InvalidAddress(address invalidAddress, string context);
+    error ImplementationNotSet(string details);
+    error NFTTransferFailed(address from, address to, uint256 tokenId);
+    error RefundFailed(uint256 amount, address recipient);
+    error ApprovalFailed(address owner, address spender, uint256 tokenId);
+    error InitializationFailed(address manager, string reason);
 
     event ManagerDeployed(
         address indexed creator,
@@ -102,28 +102,6 @@ contract AgentStudioFactory is AccessControl {
     event TreasuryFactoryUpdated(address indexed oldFactory, address indexed newFactory);
     event PremineZapUpdated(address indexed oldZap, address indexed newZap);
     event NFTRecovered(address indexed nftContract, uint256 indexed tokenId, address indexed to);
-
-
-    event DeploymentStep(
-        uint256 step,
-        string message,
-        address addr,
-        uint256 value,
-        string detail
-    );
-
-    event DebugStep(
-        uint256 step,
-        string message,
-        address addr,
-        uint256 num,
-        uint256 value
-    );
-
-    event DebugError(
-        string action,
-        string reason
-    );
 
     constructor(
         address _premineZap,
@@ -147,45 +125,60 @@ contract AgentStudioFactory is AccessControl {
     function deployAndFlaunch(
         IPositionManager.FlaunchParams calldata flaunchParams
     ) external payable returns (address manager, address memecoin) {
-        if (revenueManagerImplementation == address(0)) revert ImplementationNotSet();
-        if (flaunchParams.creator == address(0)) revert InvalidAddress();
+        if (revenueManagerImplementation == address(0)) revert ImplementationNotSet("Revenue manager implementation address not configured");
+        if (flaunchParams.creator == address(0)) revert InvalidAddress(flaunchParams.creator, "Creator address cannot be zero");
+        uint256 startBalance = address(this).balance;
 
-        // Flaunch with original creator (user)
-        (address _memecoin, uint256 ethSpent) = premineZap.flaunch{value: msg.value}(
-            flaunchParams
-        );
+        // Store original creator
+        address originalCreator = flaunchParams.creator;
+        
+        // Modify flaunchParams to set creator as the factory
+        IPositionManager.FlaunchParams memory modifiedParams = flaunchParams;
+        modifiedParams.creator = address(this);
+
+        // Flaunch with original creator (user). The `ethSpent` is only allocated when we
+        // premine, otherwise the fee may not be included. For this reason, we calculate the
+        // balance based on balance change.
+        (address _memecoin,) = premineZap.flaunch{value: msg.value}(modifiedParams);
+
         memecoin = _memecoin;
 
         // Get Flaunch contract and tokenId
         IFlaunch flaunch = premineZap.flaunchContract();
         uint256 tokenId = flaunch.tokenId(memecoin);
 
-        // Deploy manager using approved implementation
+        // Deploy manager 
         address payable revenueManager = treasuryFactory.deployManager(revenueManagerImplementation);
+
+        // Approve the revenue manager to use our tokenId
+        flaunch.approve{value: 0}(revenueManager, tokenId);
 
         // Initialize manager
         try IRevenueManager(revenueManager).initialize(
             tokenId,
-            msg.sender,
+            address(this),
             abi.encode(IRevenueManager.InitParams({
-                creator: payable(flaunchParams.creator),
+                creator: payable(originalCreator),
                 protocolRecipient: payable(platformFeeReceiver),
                 protocolFee: platformFeeBps
             }))
         ) {
             // Update tracking relationships
             isRegisteredManager[revenueManager] = true;
-            creatorToManagers[flaunchParams.creator].push(revenueManager);
+            creatorToManagers[originalCreator].push(revenueManager);
             memecoinToManager[memecoin] = revenueManager;
 
             // Refund excess ETH if any
-            uint256 refund = msg.value - ethSpent;
-            if (refund > 0) {
-                (bool success,) = msg.sender.call{value: refund}("");
-                if (!success) revert RefundFailed();
+            uint256 ethUsed = startBalance + msg.value - address(this).balance;
+            if (ethUsed <= msg.value) {
+                uint256 refundAmount = msg.value - ethUsed;
+                if (refundAmount > 0) {
+                    (bool success,) = msg.sender.call{value: refundAmount}("");
+                    if (!success) revert RefundFailed(refundAmount, msg.sender);
+                }
             }
 
-            emit ManagerDeployed(flaunchParams.creator, revenueManager, memecoin, tokenId);
+            emit ManagerDeployed(originalCreator, revenueManager, memecoin, tokenId);
             return (revenueManager, memecoin);
         } catch Error(string memory reason) {
             revert(string(abi.encodePacked("Initialize failed: ", reason)));
@@ -206,11 +199,11 @@ contract AgentStudioFactory is AccessControl {
         address payable newCreator
     ) external {
         require(isRegisteredManager[manager], "Not a registered manager");
-        if (newCreator == address(0)) revert InvalidAddress();
+        if (newCreator == address(0)) revert InvalidAddress(newCreator, "Creator address cannot be zero");
 
         // Verify caller is current creator
         IRevenueManager revenueManager = IRevenueManager(manager);
-        if (msg.sender != address(revenueManager.creator())) revert NotCreator();
+        if (msg.sender != address(revenueManager.creator())) revert NotCreator(msg.sender, address(revenueManager.creator()));
 
         // Update creator in manager
         revenueManager.setCreator(payable(newCreator));
@@ -278,7 +271,7 @@ contract AgentStudioFactory is AccessControl {
         address recipient
     ) external onlyRole(ADMIN_ROLE) {
         require(isRegisteredManager[manager], "Not a registered manager");
-        if (recipient == address(0)) revert InvalidAddress();
+        if (recipient == address(0)) revert InvalidAddress(recipient, "Creator address cannot be zero");
 
         // Get token ID
         IRevenueManager revenueManager = IRevenueManager(manager);
@@ -311,7 +304,7 @@ contract AgentStudioFactory is AccessControl {
         try IERC721(nftContract).transferFrom(address(this), to, tokenId) {
             emit NFTRecovered(nftContract, tokenId, to);
         } catch {
-            revert NFTTransferFailed();
+            revert NFTTransferFailed(address(this), to, tokenId);
         }
     }
 
