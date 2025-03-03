@@ -17,6 +17,8 @@ interface IPositionManager {
         bytes initialPriceParams;
         bytes feeCalculatorParams;
     }
+
+    function balances(address _recipient) external view returns (uint256 _amount);
 }
 
 interface ITreasuryManagerFactory {
@@ -363,9 +365,14 @@ contract AgentStudioFactory is AccessControl {
         creator = revenueManager.creator();
         protocolRecipient = revenueManager.protocolRecipient();
         protocolFee = revenueManager.protocolFee();
+        
+        // Get the position manager contract
+        IPositionManager positionManager = premineZap.positionManager();
+        
+        // Get claimable fees balance from the position manager contract
+        uint256 balance = positionManager.balances(manager);
 
-        // Get balance if any
-        uint256 balance = address(manager).balance;
+        // Calculate fee splits based on protocol fee percentage
         if (balance > 0) {
             protocolAmount = (balance * protocolFee) / 10000;
             creatorAmount = balance - protocolAmount;
