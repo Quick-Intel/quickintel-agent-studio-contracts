@@ -45,6 +45,7 @@ interface IPremineZap {
 interface IFlaunch {
     function tokenId(address _memecoin) external view returns (uint256);
     function approve(address to, uint256 tokenId) external payable;
+    function ownerOf(uint256 id) external view returns (address result);
 }
 
 interface ITreasuryManager {
@@ -201,27 +202,33 @@ contract AgentStudioFactory is AccessControl, ReentrancyGuard {
 
     function deployExistingFlaunch(
         address _memecoin
-    ) external payable nonReentrant returns (address manager, address memecoin) {
+    ) external returns (address manager, address memecoin) {
         if (revenueManagerImplementation == address(0)) revert ImplementationNotSet("Revenue manager implementation address not configured");
-        if (msg.sender == address(0)) revert InvalidAddress(msg.sender, "Owner address cannot be zero");
-        uint256 startBalance = address(this).balance;
-
-        // Store original creator
+        
+        // Store original owner
         address originalCreator = msg.sender;
 
         // Get Flaunch contract and tokenId
         IFlaunch flaunch = premineZap.flaunchContract();
         uint256 tokenId = flaunch.tokenId(_memecoin);
-
-        // Ownership check
-        require(IERC721(address(flaunch)).ownerOf(tokenId) == msg.sender, "Caller is not the token owner");
+        
+        // Verify ownership
+        if (flaunch.ownerOf(tokenId) != msg.sender) 
+            revert NotCreator(msg.sender, flaunch.ownerOf(tokenId));
 
         memecoin = _memecoin;
+        
+        // Transfer the token from the user to this contract
+        try IERC721(address(flaunch)).transferFrom(msg.sender, address(this), tokenId) {
+            // Token transferred successfully
+        } catch {
+            revert("Token transfer failed - Did you approve this contract?");
+        }
 
         // Deploy manager 
         address payable revenueManager = treasuryFactory.deployManager(revenueManagerImplementation);
 
-        // Approve the revenue manager to use our tokenId
+        // Approve the manager
         flaunch.approve{value: 0}(revenueManager, tokenId);
 
         // Initialize manager
@@ -240,19 +247,16 @@ contract AgentStudioFactory is AccessControl, ReentrancyGuard {
             memecoinToManager[memecoin] = revenueManager;
             managerToMemecoin[revenueManager] = memecoin;
 
-            // Refund excess ETH if any
-            uint256 ethUsed = startBalance + msg.value - address(this).balance;
-            if (ethUsed <= msg.value) {
-                uint256 refundAmount = msg.value - ethUsed;
-                if (refundAmount > 0) {
-                    (bool success,) = msg.sender.call{value: refundAmount}("");
-                    if (!success) revert RefundFailed(refundAmount, msg.sender);
-                }
-            }
-
             emit ManagerDeployed(originalCreator, revenueManager, memecoin, tokenId);
             return (revenueManager, memecoin);
         } catch Error(string memory reason) {
+            // If initialization fails, transfer the token back to the user
+            try IERC721(address(flaunch)).transferFrom(address(this), msg.sender, tokenId) {
+                // Successfully returned the token
+            } catch {
+                // Failed to return the token
+            }
+            
             revert(string(abi.encodePacked("Initialize failed: ", reason)));
         }
     }
@@ -334,7 +338,7 @@ contract AgentStudioFactory is AccessControl, ReentrancyGuard {
     }
 
     function updatePlatformFee(uint256 newFeeBps) external onlyRole(FEE_MANAGER_ROLE) {
-        require(newFeeBps <= 10000, "Fee cannot exceed 100%");
+        if (newFeeBps > 10000) revert FeeTooHigh(newFeeBps);
         uint256 oldFee = platformFeeBps;
         platformFeeBps = newFeeBps;
 
@@ -352,6 +356,8 @@ contract AgentStudioFactory is AccessControl, ReentrancyGuard {
         IRevenueManager revenueManager = IRevenueManager(manager);
         uint256 tokenId = revenueManager.tokenId();
 
+        address memecoin = managerToMemecoin[manager];
+
         // Call rescue on the manager
         ITreasuryManager(manager).rescue(tokenId, recipient);
 
@@ -365,6 +371,11 @@ contract AgentStudioFactory is AccessControl, ReentrancyGuard {
                 break;
             }
         }
+
+        if (memecoin != address(0)) {
+            delete memecoinToManager[memecoin];
+        }
+        delete managerToMemecoin[manager];
         isRegisteredManager[manager] = false;
     }
 
